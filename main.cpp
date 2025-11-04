@@ -4,21 +4,20 @@ using namespace std;
 /*
 Problem 015 - File Storage (ACMOJ 2545)
 
-Optimized design v2:
-- Persist data in 16 bucket files under data/ directory: data/bk_0.dat ... data/bk_15.dat
-- Each bucket file stores lines: <index>\t<count>\t<ascending values>\n
-Performance optimizations:
-- Maintain a small LRU cache of bucket contents in memory (capacity = 2) to reduce load/flush thrashing
-  when operations alternate between buckets.
-- Parse without sort/unique since we always write sorted-unique lists.
-- Flush a bucket only on eviction or at program end.
+Optimized design v3:
+- 20 bucket files under data/ directory: data/bk_0.dat ... data/bk_19.dat
+- Small LRU cache of bucket contents (capacity = 6) to balance time vs memory
+- Binary on-disk format for fast load/flush
+  Header: 'BK1\0' (4 bytes)
+  Repeated records: [u8 key_len][key bytes][u32 count][count * i32 values]
+  Values are sorted ascending and unique.
+- Fallback: if header missing, read legacy text format (index\tcount\tvals) then rewrite as binary on next flush.
 
-Memory:
-- Only up to 2 buckets are loaded concurrently to respect the ~6 MiB limit.
+Memory: at most 6 buckets cached concurrently to respect ~6 MiB limit.
 */
 
-static const int NUM_BUCKETS = 16; // keep under 20 files limit
-static const int BUCKET_CACHE_CAP = 8; // LRU capacity
+static const int NUM_BUCKETS = 20; // stay within 20-file limit
+static const int BUCKET_CACHE_CAP = 6; // LRU capacity
 static const string DATA_DIR = "data";
 
 static string bucket_path(int b) {
@@ -36,19 +35,16 @@ struct Bucket {
     bool dirty = false;
 };
 
-// Parse a bucket line: index\tcount\tval1 val2 ... (values are already sorted unique)
+// Fallback text parser: index\tcount\tval1 val2 ... (values are already sorted unique)
 static bool parse_line_fast(const string &line, string &index_out, vector<int> &vals_out) {
     size_t p1 = line.find('\t');
     if (p1 == string::npos) return false;
     size_t p2 = line.find('\t', p1 + 1);
     if (p2 == string::npos) return false;
     index_out.assign(line.data(), p1);
-    // skip count: line.substr(p1+1, p2-(p1+1))
     vals_out.clear();
-    // parse values from p2+1 to end
     const char *s = line.c_str() + p2 + 1;
     char *endptr = nullptr;
-    // Use strtol-like parsing for speed
     while (*s) {
         while (*s == ' ') ++s;
         if (!*s) break;
@@ -58,21 +54,6 @@ static bool parse_line_fast(const string &line, string &index_out, vector<int> &
         s = endptr;
     }
     return true;
-}
-
-static string serialize_line(const string &idx, const vector<int> &vals) {
-    string s;
-    // rough reserve: index + count(+tab) + values
-    s.reserve(idx.size() + 16 + vals.size() * 12);
-    s += idx;
-    s += '\t';
-    s += to_string((int)vals.size());
-    s += '\t';
-    for (size_t i = 0; i < vals.size(); ++i) {
-        if (i) s += ' ';
-        s += to_string(vals[i]);
-    }
-    return s;
 }
 
 // LRU cache: bucket id -> Bucket
@@ -92,16 +73,61 @@ static void touch_lru(int b) {
     }
 }
 
-static void flush_bucket_to_disk(int b, const Bucket &bk) {
-    if (!bk.dirty) return;
+// Binary load/flush
+static bool load_bucket_binary_file(const string &path, Bucket &bk) {
+    ifstream fin(path, ios::binary);
+    if (!fin.good()) return true; // empty is ok
+    char hdr[4];
+    if (!fin.read(hdr, 4)) return false;
+    if (!(hdr[0]=='B' && hdr[1]=='K' && hdr[2]=='1' && hdr[3]=='\0')) return false;
+    bk.map.reserve(1024);
+    while (true) {
+        unsigned char klen = 0;
+        if (!fin.read(reinterpret_cast<char*>(&klen), 1)) break; // EOF
+        string key;
+        key.resize(klen);
+        if (klen && !fin.read(&key[0], klen)) return false;
+        uint32_t cnt = 0;
+        if (!fin.read(reinterpret_cast<char*>(&cnt), 4)) return false;
+        vector<int> vals(cnt);
+        if (cnt) {
+            if (!fin.read(reinterpret_cast<char*>(vals.data()), cnt * sizeof(int))) return false;
+        }
+        bk.map.emplace(std::move(key), std::move(vals));
+    }
+    return true;
+}
+
+static bool load_bucket_text_file(const string &path, Bucket &bk) {
+    ifstream fin(path);
+    if (!fin.good()) return true; // treat as empty
+    string line, idx;
+    vector<int> vals;
+    bk.map.reserve(1024);
+    while (getline(fin, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!parse_line_fast(line, idx, vals)) continue;
+        bk.map.emplace(idx, vals);
+    }
+    return true;
+}
+
+static void flush_bucket_binary_file(const string &path, const Bucket &bk) {
     filesystem::create_directories(DATA_DIR);
-    string path = bucket_path(b);
     string tmp = path + ".tmp";
     {
-        ofstream fout(tmp);
-        // Serialize entries; order doesn't matter
+        ofstream fout(tmp, ios::binary);
+        const char hdr[4] = {'B','K','1','\0'};
+        fout.write(hdr, 4);
         for (const auto &kv : bk.map) {
-            fout << serialize_line(kv.first, kv.second) << '\n';
+            const string &key = kv.first;
+            const vector<int> &vals = kv.second;
+            unsigned char klen = (unsigned char)(key.size() & 0xFF);
+            fout.write(reinterpret_cast<const char*>(&klen), 1);
+            if (klen) fout.write(key.data(), klen);
+            uint32_t cnt = (uint32_t)vals.size();
+            fout.write(reinterpret_cast<const char*>(&cnt), 4);
+            if (cnt) fout.write(reinterpret_cast<const char*>(vals.data()), cnt * sizeof(int));
         }
         fout.flush();
     }
@@ -111,6 +137,12 @@ static void flush_bucket_to_disk(int b, const Bucket &bk) {
         filesystem::remove(path);
         filesystem::rename(tmp, path);
     }
+}
+
+static void flush_bucket_to_disk(int b, const Bucket &bk) {
+    if (!bk.dirty) return;
+    string path = bucket_path(b);
+    flush_bucket_binary_file(path, bk);
 }
 
 static void evict_if_needed() {
@@ -133,19 +165,12 @@ static Bucket &load_bucket(int b) {
         return it->second;
     }
     evict_if_needed();
-    // Load from disk
     Bucket bk;
     string path = bucket_path(b);
-    ifstream fin(path);
-    string line;
-    string idx;
-    vector<int> vals;
-    // Reserve some capacity to reduce rehashing
-    bk.map.reserve(1024);
-    while (fin.good() && getline(fin, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!parse_line_fast(line, idx, vals)) continue;
-        bk.map.emplace(idx, vals);
+    bool ok = load_bucket_binary_file(path, bk);
+    if (!ok) {
+        bk.map.clear();
+        load_bucket_text_file(path, bk);
     }
     bk.dirty = false;
     auto [insIt, _] = cache.emplace(b, std::move(bk));
