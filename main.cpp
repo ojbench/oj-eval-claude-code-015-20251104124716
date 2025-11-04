@@ -18,7 +18,7 @@ Memory:
 */
 
 static const int NUM_BUCKETS = 16; // keep under 20 files limit
-static const int BUCKET_CACHE_CAP = 4; // LRU capacity
+static const int BUCKET_CACHE_CAP = 8; // LRU capacity
 static const string DATA_DIR = "data";
 
 static string bucket_path(int b) {
@@ -140,6 +140,8 @@ static Bucket &load_bucket(int b) {
     string line;
     string idx;
     vector<int> vals;
+    // Reserve some capacity to reduce rehashing
+    bk.map.reserve(1024);
     while (fin.good() && getline(fin, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (!parse_line_fast(line, idx, vals)) continue;
