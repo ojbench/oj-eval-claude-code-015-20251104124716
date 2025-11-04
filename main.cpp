@@ -17,7 +17,7 @@ Memory: at most 6 buckets cached concurrently to respect ~6 MiB limit.
 */
 
 static const int NUM_BUCKETS = 20; // stay within 20-file limit
-static const int BUCKET_CACHE_CAP = 6; // LRU capacity
+static const int BUCKET_CACHE_CAP = NUM_BUCKETS; // cache all buckets to avoid evictions
 static const string DATA_DIR = "data";
 
 static string bucket_path(int b) {
