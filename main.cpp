@@ -4,22 +4,21 @@ using namespace std;
 /*
 Problem 015 - File Storage (ACMOJ 2545)
 
-Optimized design:
+Optimized design v2:
 - Persist data in 16 bucket files under data/ directory: data/bk_0.dat ... data/bk_15.dat
 - Each bucket file stores lines: <index>\t<count>\t<ascending values>\n
-Performance optimization:
-- Maintain a single in-memory cache for the currently active bucket only.
-- On first access to a bucket in this run, load the entire bucket file into an unordered_map<string, vector<int>>.
-- Apply operations to this map in O(log n) per index via lower_bound on the vector.
-- Flush the bucket map back to disk only when switching to another bucket or at program end.
-- This avoids scanning and rewriting the bucket file on every operation, dramatically reducing disk I/O.
+Performance optimizations:
+- Maintain a small LRU cache of bucket contents in memory (capacity = 2) to reduce load/flush thrashing
+  when operations alternate between buckets.
+- Parse without sort/unique since we always write sorted-unique lists.
+- Flush a bucket only on eviction or at program end.
 
 Memory:
-- Only one bucket is loaded at a time; with 16 buckets and total entries <= 100k, per-bucket memory stays within 5–6 MiB.
-
+- Only up to 2 buckets are loaded concurrently to respect the ~6 MiB limit.
 */
 
 static const int NUM_BUCKETS = 16; // keep under 20 files limit
+static const int BUCKET_CACHE_CAP = 2; // LRU capacity
 static const string DATA_DIR = "data";
 
 static string bucket_path(int b) {
@@ -31,80 +30,79 @@ static int bucket_id(const string &key) {
     return (int)(h % NUM_BUCKETS);
 }
 
-struct BucketLine {
-    string index;
-    vector<int> values; // sorted ascending, unique
+struct Bucket {
+    // index -> sorted unique values
+    unordered_map<string, vector<int>> map;
+    bool dirty = false;
 };
 
-// Parse a bucket line: index\tcount\tval1 val2 ...
-static bool parse_line(const string &line, BucketLine &out) {
+// Parse a bucket line: index\tcount\tval1 val2 ... (values are already sorted unique)
+static bool parse_line_fast(const string &line, string &index_out, vector<int> &vals_out) {
     size_t p1 = line.find('\t');
     if (p1 == string::npos) return false;
     size_t p2 = line.find('\t', p1 + 1);
     if (p2 == string::npos) return false;
-    out.index = line.substr(0, p1);
-    string vals = line.substr(p2 + 1);
-    out.values.clear();
-    if (!vals.empty()) {
-        stringstream ss(vals);
-        int x;
-        while (ss >> x) out.values.push_back(x);
+    index_out.assign(line.data(), p1);
+    // skip count: line.substr(p1+1, p2-(p1+1))
+    vals_out.clear();
+    // parse values from p2+1 to end
+    const char *s = line.c_str() + p2 + 1;
+    char *endptr = nullptr;
+    // Use strtol-like parsing for speed
+    while (*s) {
+        while (*s == ' ') ++s;
+        if (!*s) break;
+        long v = strtol(s, &endptr, 10);
+        if (s == endptr) break;
+        vals_out.push_back((int)v);
+        s = endptr;
     }
-    // Ensure sorted unique
-    sort(out.values.begin(), out.values.end());
-    out.values.erase(unique(out.values.begin(), out.values.end()), out.values.end());
     return true;
 }
 
-static string serialize_line(const BucketLine &bl) {
+static string serialize_line(const string &idx, const vector<int> &vals) {
     string s;
-    s.reserve(bl.index.size() + bl.values.size() * 12);
-    s += bl.index;
+    // rough reserve: index + count(+tab) + values
+    s.reserve(idx.size() + 16 + vals.size() * 12);
+    s += idx;
     s += '\t';
-    s += to_string((int)bl.values.size());
+    s += to_string((int)vals.size());
     s += '\t';
-    for (size_t i = 0; i < bl.values.size(); ++i) {
+    for (size_t i = 0; i < vals.size(); ++i) {
         if (i) s += ' ';
-        s += to_string(bl.values[i]);
+        s += to_string(vals[i]);
     }
     return s;
 }
 
-// Single-bucket cache
-static int curr_bucket = -1;
-static unordered_map<string, vector<int>> bucket_map;
-static bool bucket_dirty = false;
+// LRU cache: bucket id -> Bucket
+static unordered_map<int, Bucket> cache;
+static list<int> lru; // front = most recent, back = least recent
+static unordered_map<int, list<int>::iterator> where;
 
-static void load_bucket(int b) {
-    bucket_map.clear();
-    string path = bucket_path(b);
-    ifstream fin(path);
-    string line;
-    while (fin.good() && getline(fin, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        BucketLine bl;
-        if (!parse_line(line, bl)) continue;
-        bucket_map.emplace(std::move(bl.index), std::move(bl.values));
+static void touch_lru(int b) {
+    auto it = where.find(b);
+    if (it != where.end()) {
+        lru.erase(it->second);
+        lru.push_front(b);
+        it->second = lru.begin();
+    } else {
+        lru.push_front(b);
+        where[b] = lru.begin();
     }
-    bucket_dirty = false;
 }
 
-// Write bucket_map back to file (atomic via temp file)
-static void flush_bucket(int b) {
-    if (!bucket_dirty) return;
-    vector<string> lines;
-    lines.reserve(bucket_map.size());
-    for (const auto &kv : bucket_map) {
-        BucketLine bl{kv.first, kv.second};
-        lines.push_back(serialize_line(bl));
-    }
-    // Ensure directory exists
+static void flush_bucket_to_disk(int b, const Bucket &bk) {
+    if (!bk.dirty) return;
     filesystem::create_directories(DATA_DIR);
     string path = bucket_path(b);
     string tmp = path + ".tmp";
     {
         ofstream fout(tmp);
-        for (const auto &s : lines) fout << s << '\n';
+        // Serialize entries; order doesn't matter
+        for (const auto &kv : bk.map) {
+            fout << serialize_line(kv.first, kv.second) << '\n';
+        }
         fout.flush();
     }
     std::error_code ec;
@@ -113,45 +111,75 @@ static void flush_bucket(int b) {
         filesystem::remove(path);
         filesystem::rename(tmp, path);
     }
-    bucket_dirty = false;
 }
 
-static void ensure_bucket(int b) {
-    if (curr_bucket == b) return;
-    if (curr_bucket != -1) flush_bucket(curr_bucket);
-    curr_bucket = b;
-    load_bucket(b);
+static void evict_if_needed() {
+    if ((int)cache.size() < BUCKET_CACHE_CAP) return;
+    // Evict least recently used (back)
+    int victim = lru.back();
+    lru.pop_back();
+    where.erase(victim);
+    auto it = cache.find(victim);
+    if (it != cache.end()) {
+        flush_bucket_to_disk(victim, it->second);
+        cache.erase(it);
+    }
+}
+
+static Bucket &load_bucket(int b) {
+    auto it = cache.find(b);
+    if (it != cache.end()) {
+        touch_lru(b);
+        return it->second;
+    }
+    evict_if_needed();
+    // Load from disk
+    Bucket bk;
+    string path = bucket_path(b);
+    ifstream fin(path);
+    string line;
+    string idx;
+    vector<int> vals;
+    while (fin.good() && getline(fin, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!parse_line_fast(line, idx, vals)) continue;
+        bk.map.emplace(idx, vals);
+    }
+    bk.dirty = false;
+    auto [insIt, _] = cache.emplace(b, std::move(bk));
+    touch_lru(b);
+    return insIt->second;
 }
 
 static void cmd_insert(const string &idx, int val) {
     int b = bucket_id(idx);
-    ensure_bucket(b);
-    auto &vec = bucket_map[idx]; // creates empty if not exists
+    Bucket &bk = load_bucket(b);
+    auto &vec = bk.map[idx]; // creates empty if not exists
     auto it = lower_bound(vec.begin(), vec.end(), val);
     if (it == vec.end() || *it != val) {
         vec.insert(it, val);
-        bucket_dirty = true;
+        bk.dirty = true;
     }
 }
 
 static void cmd_delete(const string &idx, int val) {
     int b = bucket_id(idx);
-    ensure_bucket(b);
-    auto itIdx = bucket_map.find(idx);
-    if (itIdx == bucket_map.end()) return;
+    Bucket &bk = load_bucket(b);
+    auto itIdx = bk.map.find(idx);
+    if (itIdx == bk.map.end()) return;
     auto &vec = itIdx->second;
     auto it = lower_bound(vec.begin(), vec.end(), val);
     if (it != vec.end() && *it == val) {
         vec.erase(it);
-        bucket_dirty = true;
+        bk.dirty = true;
     }
 }
 
 static void cmd_find(const string &idx) {
     int b = bucket_id(idx);
-    ensure_bucket(b);
-    auto itIdx = bucket_map.find(idx);
-    if (itIdx == bucket_map.end() || itIdx->second.empty()) {
+    Bucket &bk = load_bucket(b);
+    auto itIdx = bk.map.find(idx);
+    if (itIdx == bk.map.end() || itIdx->second.empty()) {
         cout << "null\n";
         return;
     }
@@ -167,7 +195,6 @@ int main() {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
 
-    // Ensure data directory exists
     filesystem::create_directories(DATA_DIR);
 
     int n;
@@ -184,9 +211,13 @@ int main() {
         } else if (cmd == "find") {
             cmd_find(idx);
         } else {
-            // invalid command (shouldn't happen per spec)
+            // invalid command
         }
     }
-    if (curr_bucket != -1) flush_bucket(curr_bucket);
+    // Flush all cached buckets
+    for (const auto &b : lru) {
+        auto it = cache.find(b);
+        if (it != cache.end()) flush_bucket_to_disk(b, it->second);
+    }
     return 0;
 }
