@@ -18,7 +18,7 @@ Memory:
 */
 
 static const int NUM_BUCKETS = 16; // keep under 20 files limit
-static const int BUCKET_CACHE_CAP = 2; // LRU capacity
+static const int BUCKET_CACHE_CAP = 4; // LRU capacity
 static const string DATA_DIR = "data";
 
 static string bucket_path(int b) {

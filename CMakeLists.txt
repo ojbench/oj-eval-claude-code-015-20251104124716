@@ -12,7 +12,8 @@ add_executable(code
   main.cpp
 )
 
-# Optimize for speed and small binary size
+# Optimize for speed
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-  target_compile_options(code PRIVATE -O2 -pipe -static-libstdc++ -static-libgcc)
+  target_compile_options(code PRIVATE -O3 -pipe -DNDEBUG -march=native -flto=auto -fno-exceptions -fno-rtti)
+  target_link_options(code PRIVATE -flto=auto)
 endif()
